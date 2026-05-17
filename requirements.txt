@@ -1,0 +1,15 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.6
+langchain>=0.3.7
+langchain-community>=0.3.7
+langchain-openai>=0.2.9
+chromadb>=0.5.18
+sentence-transformers>=3.2.1
+transformers>=4.46.2
+torch>=2.6.0
+python-dotenv>=1.0.1
+numpy>=1.26.4
+scikit-learn>=1.5.2
+pydantic>=2.9.2
+requests>=2.32.3
+beautifulsoup4>=4.12.3

@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: shl-recommender
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: LLM_PROVIDER
+        value: groq
+      - key: LLM_MODEL
+        value: llama-3.3-70b-versatile
+      - key: GROQ_API_KEY
+        sync: false          # Set this in Render dashboard — never hardcode
+      - key: EMBEDDING_MODEL
+        value: all-MiniLM-L6-v2
+      - key: CHROMA_PERSIST_DIR
+        value: ./vectorstore/chroma_db
+      - key: CATALOG_PATH
+        value: ./data/catalog.json
+      - key: LOG_LEVEL
+        value: INFO
