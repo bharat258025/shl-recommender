@@ -1,107 +1,87 @@
 """
 retriever.py
-Semantic search over SHL catalog + rule-based reranking.
-
-Two-stage retrieval:
-  1. ChromaDB MMR search (semantic similarity, broad recall)
-  2. Rule-based reranker (boosts domain-specific must-haves, kills wrong-domain results)
-
-This hybrid approach means recall doesn't depend on the LLM following prompt instructions.
+Semantic search using chromadb's built-in ONNX embeddings.
+Memory usage: ~80MB vs ~800MB with torch/sentence-transformers.
+Fits comfortably within Render free tier (512MB limit).
 """
 
 import json
 import logging
 import os
-import re
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
+import chromadb
+from chromadb.utils import embedding_functions
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./vectorstore/chroma_db")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 CATALOG_PATH = os.getenv("CATALOG_PATH", "./data/catalog.json")
 
 
-# ── Domain rules ──────────────────────────────────────────────────────────────
-# Each rule: if ANY trigger keyword found in query → boost these assessments
-# Scores are additive. Top-scored results rise to the top.
+# ── Domain rules for reranking ────────────────────────────────────────────────
 
 DOMAIN_RULES = [
-    # Data analyst / SQL / BI
     {
         "triggers": ["data analyst", "sql", "dashboard", "reporting", "bi ", "business intelligence", "tableau", "power bi"],
         "boost": ["SQL (New)", "Verify Numerical Reasoning", "Verify Verbal Reasoning"],
         "suppress": ["Management & Leadership Report (MLR)", "Sales Solution (SSCE)", "Contact Center Solution"],
     },
-    # Java developer
     {
         "triggers": ["java"],
         "boost": ["Java 8 (New)", "Verify Inductive Reasoning", "Technology Professional (TP1)"],
         "suppress": ["Sales Solution (SSCE)", "Contact Center Solution", "Dependability & Safety Instrument (DSI)"],
     },
-    # Python / data science / ML
     {
         "triggers": ["python", "data science", "machine learning", "ml engineer"],
         "boost": ["Python (New)", "Verify Inductive Reasoning", "Verify Numerical Reasoning"],
         "suppress": ["Sales Solution (SSCE)", "Contact Center Solution"],
     },
-    # JavaScript / frontend / web
     {
-        "triggers": ["javascript", "frontend", "react", "nodejs", "full-stack", "fullstack", "web developer"],
+        "triggers": ["javascript", "frontend", "react", "nodejs", "full-stack", "web developer"],
         "boost": ["JavaScript (New)", "Verify Inductive Reasoning"],
         "suppress": ["Sales Solution (SSCE)", "Contact Center Solution"],
     },
-    # Sales
-    {
-        "triggers": ["sales", "b2b", "b2c", "account manager", "business development", "revenue", "quota"],
-        "boost": ["Sales Solution (SSCE)", "OPQ32r"],
-        "suppress": ["Contact Center Solution", "Dependability & Safety Instrument (DSI)", "SQL (New)"],
-    },
-    # Sales MANAGER specifically — add MLR
     {
         "triggers": ["sales manager", "head of sales", "vp sales", "director of sales"],
         "boost": ["Sales Solution (SSCE)", "OPQ32r", "Management & Leadership Report (MLR)"],
         "suppress": ["Universal Competency Report (UCR)", "Contact Center Solution"],
     },
-    # Manager / leadership (non-sales)
     {
-        "triggers": ["manager", "director", "executive", "leadership", "vp ", "head of", "c-suite", "cto", "ceo"],
+        "triggers": ["sales", "b2b", "b2c", "account manager", "business development", "revenue"],
+        "boost": ["Sales Solution (SSCE)", "OPQ32r"],
+        "suppress": ["Contact Center Solution", "Dependability & Safety Instrument (DSI)", "SQL (New)"],
+    },
+    {
+        "triggers": ["manager", "director", "executive", "leadership", "head of", "c-suite"],
         "boost": ["OPQ32r", "Management & Leadership Report (MLR)"],
         "suppress": ["Contact Center Solution", "Dependability & Safety Instrument (DSI)"],
     },
-    # Graduate / campus / fresh
     {
         "triggers": ["graduate", "campus", "fresh graduate", "entry level", "early career", "university", "college", "intern"],
         "boost": ["Graduate 8.0 (Short)", "Graduate Personality Questionnaire"],
         "suppress": ["Management & Leadership Report (MLR)", "Sales Solution (SSCE)", "Contact Center Solution"],
     },
-    # Warehouse / logistics / operations / safety
     {
-        "triggers": ["warehouse", "logistics", "operations", "safety", "forklift", "manufacturing", "supply chain", "blue collar"],
+        "triggers": ["warehouse", "logistics", "operations", "safety", "manufacturing", "supply chain", "blue collar"],
         "boost": ["Dependability & Safety Instrument (DSI)", "Operational Assessment (OP5)"],
         "suppress": ["OPQ32r", "Management & Leadership Report (MLR)", "Sales Solution (SSCE)", "SQL (New)", "Java 8 (New)"],
     },
-    # Contact center / BPO / call center
     {
-        "triggers": ["contact center", "call center", "bpo", "inbound", "outbound", "customer support", "helpdesk"],
+        "triggers": ["contact center", "call center", "bpo", "inbound", "outbound", "customer support"],
         "boost": ["Contact Center Solution", "CustomerFirst (CF3)", "Workplace English (WE1)"],
         "suppress": ["Management & Leadership Report (MLR)", "SQL (New)", "Java 8 (New)"],
     },
-    # Stakeholder work → add personality/SJT
     {
         "triggers": ["stakeholder", "client facing", "cross-functional", "collaborate", "teamwork"],
         "boost": ["OPQ32r", "Technology Professional (TP1)"],
         "suppress": [],
     },
-    # Personality explicitly requested
     {
-        "triggers": ["personality", "behavior", "culture fit", "soft skills", "work style"],
+        "triggers": ["personality", "behavior", "culture fit", "soft skills"],
         "boost": ["OPQ32r", "Motivation Questionnaire (MQM5)"],
         "suppress": [],
     },
@@ -109,73 +89,43 @@ DOMAIN_RULES = [
 
 
 def _rerank(query: str, results: list[dict]) -> list[dict]:
-    """
-    Apply domain rules to rerank retrieved results.
-    - Boosted assessments get +10 score each time a rule matches
-    - Suppressed assessments get -5 score each time a rule matches
-    - Results are sorted by final score descending
-    - Suppressed-only results (score < 0) are removed if we have enough boosted ones
-    """
     q = query.lower()
     scores = {r["name"]: 0.0 for r in results}
-
-    # Build a name→result map for fast lookup
     name_to_result = {r["name"]: r for r in results}
-
-    # Also build full catalog map for boosted items not in top-10
-    all_names = {r["name"] for r in results}
-
-    matched_boosts = set()  # track which names were boosted
 
     for rule in DOMAIN_RULES:
         if any(trigger in q for trigger in rule["triggers"]):
             for name in rule.get("boost", []):
-                if name not in scores:
-                    scores[name] = 0.0
-                scores[name] += 10.0
-                matched_boosts.add(name)
+                scores[name] = scores.get(name, 0.0) + 10.0
             for name in rule.get("suppress", []):
-                if name not in scores:
-                    scores[name] = 0.0
-                scores[name] -= 5.0
+                scores[name] = scores.get(name, 0.0) - 5.0
 
-    # Sort by score descending, then original rank for ties
     original_rank = {r["name"]: i for i, r in enumerate(results)}
 
     def sort_key(name):
         return (-scores.get(name, 0), original_rank.get(name, 999))
 
-    all_names_ordered = sorted(scores.keys(), key=sort_key)
-
-    # Rebuild result list — only keep items that are in original results OR were boosted
+    all_names = sorted(scores.keys(), key=sort_key)
     final = []
-    for name in all_names_ordered:
+    for name in all_names:
         if scores.get(name, 0) < 0 and len(final) >= 3:
-            continue  # Skip suppressed items once we have enough
+            continue
         if name in name_to_result:
             final.append(name_to_result[name])
-        # Boosted items not in original results are added from catalog later (in SHLRetriever.search)
 
     return final[:10]
 
 
 class SHLRetriever:
     def __init__(self):
-        self._vectorstore: Optional[Chroma] = None
+        self._collection = None
         self._catalog: list[dict] = []
-        self._embeddings = None
         self._catalog_by_name: dict[str, dict] = {}
+        self._ef = None
 
     def load(self):
-        if self._vectorstore is not None:
+        if self._collection is not None:
             return
-
-        logger.info("Loading HuggingFace embedding model...")
-        self._embeddings = HuggingFaceEmbeddings(
-            model_name=EMBEDDING_MODEL,
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True},
-        )
 
         if not Path(CHROMA_PERSIST_DIR).exists():
             raise RuntimeError(
@@ -183,10 +133,13 @@ class SHLRetriever:
                 "Run `python build_vectorstore.py` first."
             )
 
-        self._vectorstore = Chroma(
-            persist_directory=CHROMA_PERSIST_DIR,
-            embedding_function=self._embeddings,
-            collection_name="shl_assessments",
+        logger.info("Loading ONNX embedding function...")
+        self._ef = embedding_functions.ONNXMiniLM_L6_V2()
+
+        client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+        self._collection = client.get_collection(
+            name="shl_assessments",
+            embedding_function=self._ef,
         )
         logger.info("ChromaDB loaded.")
 
@@ -197,6 +150,7 @@ class SHLRetriever:
 
     def _catalog_item_to_result(self, item: dict) -> dict:
         levels = ", ".join(item.get("job_levels", [])) if isinstance(item.get("job_levels"), list) else item.get("job_levels", "")
+        keywords = ", ".join(item.get("keywords", [])) if isinstance(item.get("keywords"), list) else item.get("keywords", "")
         return {
             "name": item["name"],
             "url": item["url"],
@@ -206,38 +160,35 @@ class SHLRetriever:
             "duration_minutes": str(item.get("duration_minutes", "")),
             "remote_testing": str(item.get("remote_testing", "")),
             "adaptive": str(item.get("adaptive", "")),
-            "keywords": ", ".join(item.get("keywords", [])) if isinstance(item.get("keywords"), list) else item.get("keywords", ""),
+            "keywords": keywords,
         }
 
     def search(self, query: str, k: int = 10) -> list[dict]:
-        """
-        Two-stage retrieval:
-        1. Semantic MMR search (fetch top-15 candidates)
-        2. Rule-based reranking + forced injection of domain must-haves
-        """
-        if self._vectorstore is None:
+        if self._collection is None:
             raise RuntimeError("Retriever not loaded. Call .load() first.")
 
-        # Stage 1: semantic search — fetch more candidates than needed
-        docs = self._vectorstore.max_marginal_relevance_search(
-            query, k=15, fetch_k=30
+        # Semantic search
+        results_raw = self._collection.query(
+            query_texts=[query],
+            n_results=min(15, self._collection.count()),
         )
-        results = []
-        for doc in docs:
-            meta = doc.metadata
-            results.append({
-                "name": meta.get("name", ""),
-                "url": meta.get("url", ""),
-                "test_type": meta.get("test_type", ""),
-                "description": meta.get("description", ""),
-                "job_levels": meta.get("job_levels", ""),
-                "duration_minutes": meta.get("duration_minutes", ""),
-                "remote_testing": meta.get("remote_testing", ""),
-                "adaptive": meta.get("adaptive", ""),
-                "keywords": meta.get("keywords", ""),
-            })
 
-        # Stage 2: inject boosted items that didn't make the semantic top-15
+        results = []
+        if results_raw and results_raw["metadatas"]:
+            for meta in results_raw["metadatas"][0]:
+                results.append({
+                    "name": meta.get("name", ""),
+                    "url": meta.get("url", ""),
+                    "test_type": meta.get("test_type", ""),
+                    "description": meta.get("description", ""),
+                    "job_levels": meta.get("job_levels", ""),
+                    "duration_minutes": meta.get("duration_minutes", ""),
+                    "remote_testing": meta.get("remote_testing", ""),
+                    "adaptive": meta.get("adaptive", ""),
+                    "keywords": meta.get("keywords", ""),
+                })
+
+        # Inject domain must-haves not in semantic top-15
         q = query.lower()
         existing_names = {r["name"] for r in results}
         for rule in DOMAIN_RULES:
@@ -249,9 +200,7 @@ class SHLRetriever:
                             results.append(self._catalog_item_to_result(item))
                             existing_names.add(name)
 
-        # Stage 3: rerank
-        reranked = _rerank(query, results)
-        return reranked[:k]
+        return _rerank(query, results)[:k]
 
     def get_by_name(self, name: str) -> Optional[dict]:
         return self._catalog_by_name.get(name.lower())

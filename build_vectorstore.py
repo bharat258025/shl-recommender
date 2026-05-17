@@ -1,7 +1,8 @@
 """
 build_vectorstore.py
-Builds and persists the ChromaDB vector store from catalog.json.
-Run this ONCE before starting the server: python build_vectorstore.py
+Builds ChromaDB vector store using chromadb's built-in embedding function.
+Uses ONNXRuntime instead of torch — works within 512MB RAM on free hosting.
+Run once: python build_vectorstore.py
 """
 
 import json
@@ -10,9 +11,8 @@ import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_huggingface import HuggingFaceEmbeddings
+import chromadb
+from chromadb.utils import embedding_functions
 
 load_dotenv()
 
@@ -29,7 +29,8 @@ def load_catalog(path: str) -> list[dict]:
         return json.load(f)
 
 
-def build_document(item: dict) -> Document:
+def build_document_text(item: dict) -> str:
+    """Rich text for embedding — more context = better retrieval."""
     test_type_labels = {
         "A": "Ability / Aptitude",
         "P": "Personality / Behavior",
@@ -38,33 +39,16 @@ def build_document(item: dict) -> Document:
         "B": "Behavioral / Situational Judgement",
     }
     test_type_label = test_type_labels.get(item.get("test_type", ""), "Unknown")
-    levels = ", ".join(item.get("job_levels", []))
-    keywords = ", ".join(item.get("keywords", []))
+    levels = ", ".join(item.get("job_levels", [])) if isinstance(item.get("job_levels"), list) else item.get("job_levels", "")
+    keywords = ", ".join(item.get("keywords", [])) if isinstance(item.get("keywords"), list) else item.get("keywords", "")
 
-    content = f"""
-Assessment Name: {item['name']}
+    return f"""Assessment Name: {item['name']}
 Test Type: {test_type_label} ({item.get('test_type', '')})
 Job Levels: {levels}
 Duration: {item.get('duration_minutes', 'N/A')} minutes
 Remote Testing: {'Yes' if item.get('remote_testing') else 'No'}
-Adaptive/IRT: {'Yes' if item.get('adaptive') else 'No'}
 Description: {item['description']}
-Keywords: {keywords}
-    """.strip()
-
-    metadata = {
-        "name": item["name"],
-        "url": item["url"],
-        "test_type": item.get("test_type", ""),
-        "job_levels": levels,
-        "duration_minutes": str(item.get("duration_minutes", "")),
-        "remote_testing": str(item.get("remote_testing", "")),
-        "adaptive": str(item.get("adaptive", "")),
-        "keywords": keywords,
-        "description": item["description"],
-    }
-
-    return Document(page_content=content, metadata=metadata)
+Keywords: {keywords}""".strip()
 
 
 def build_vectorstore():
@@ -72,27 +56,53 @@ def build_vectorstore():
     catalog = load_catalog(CATALOG_PATH)
     logger.info(f"Loaded {len(catalog)} assessments")
 
-    documents = [build_document(item) for item in catalog]
-    logger.info("Documents built, loading embedding model...")
-
-    embeddings = HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-    logger.info(f"Embedding model loaded: {EMBEDDING_MODEL}")
-
     Path(CHROMA_PERSIST_DIR).mkdir(parents=True, exist_ok=True)
 
-    logger.info("Building ChromaDB vector store...")
-    vectorstore = Chroma.from_documents(
-        documents=documents,
-        embedding=embeddings,
-        persist_directory=CHROMA_PERSIST_DIR,
-        collection_name="shl_assessments",
+    # Use chromadb's built-in ONNX embedding function — no torch needed
+    logger.info(f"Setting up ONNX embedding function: {EMBEDDING_MODEL}")
+    ef = embedding_functions.ONNXMiniLM_L6_V2()
+
+    client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+
+    # Delete existing collection if rebuilding
+    try:
+        client.delete_collection("shl_assessments")
+        logger.info("Deleted existing collection")
+    except Exception:
+        pass
+
+    collection = client.create_collection(
+        name="shl_assessments",
+        embedding_function=ef,
+        metadata={"hnsw:space": "cosine"}
     )
-    logger.info(f"Vector store built with {len(documents)} documents -> {CHROMA_PERSIST_DIR}")
-    return vectorstore
+
+    documents = []
+    metadatas = []
+    ids = []
+
+    for i, item in enumerate(catalog):
+        doc_text = build_document_text(item)
+        levels = ", ".join(item.get("job_levels", [])) if isinstance(item.get("job_levels"), list) else item.get("job_levels", "")
+        keywords = ", ".join(item.get("keywords", [])) if isinstance(item.get("keywords"), list) else item.get("keywords", "")
+
+        documents.append(doc_text)
+        metadatas.append({
+            "name": item["name"],
+            "url": item["url"],
+            "test_type": item.get("test_type", ""),
+            "job_levels": levels,
+            "duration_minutes": str(item.get("duration_minutes", "")),
+            "remote_testing": str(item.get("remote_testing", "")),
+            "adaptive": str(item.get("adaptive", "")),
+            "keywords": keywords,
+            "description": item["description"],
+        })
+        ids.append(f"assessment_{i}")
+
+    collection.add(documents=documents, metadatas=metadatas, ids=ids)
+    logger.info(f"Vector store built with {len(documents)} documents → {CHROMA_PERSIST_DIR}")
+    return collection
 
 
 if __name__ == "__main__":
