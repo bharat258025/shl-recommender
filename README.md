@@ -37,7 +37,7 @@ shl-recommender/
 
 ### Step 1 — Clone and open
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/bharat258025/shl-recommender
 cd shl-recommender
 ```
 
